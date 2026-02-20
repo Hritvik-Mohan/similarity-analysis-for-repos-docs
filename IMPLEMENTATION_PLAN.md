@@ -10,7 +10,7 @@ production-grade plagiarism detection system. Tickets are grouped into three tra
 - **Track C** — Future features not implemented in either branch
 
 **Active branch:** `feat/stable-fix`
-**Last updated:** 2026-02-20 (reflects state after commit `63bda82`)
+**Last updated:** 2026-02-20 (reflects local edits to `scripts/run_similarity.py` and `repo_similarity/similarity.py` after commit `63bda82`)
 
 ### Use-Case Scope
 
@@ -31,6 +31,10 @@ Implications:
 > - `63bda82` — Refactor normalization and similarity modules; enhance fingerprinting and reporting
 > - `798548a` — Merge PR #3 from `feature/modularize-normalization`
 > - `58a78e3` — Make normalization pipeline configurable and address review feedback
+>
+> **Uncommitted local edits (post `63bda82`):**
+> - `similarity.py` — added `jaccard_cache` memoization in `compute_pairs`
+> - `scripts/run_similarity.py` — extracted magic numbers to named constants; try/except import fallback; ⚠ introduced `MODERATE_SIMILARITY_THRESHOLD` NameError (see TICKET-051)
 
 | File | Role | Status |
 |---|---|---|
@@ -39,19 +43,20 @@ Implications:
 | `repo_similarity/tokenizer.py` | File reading (`read_text`), directory walking (`collect_code_files`), regex tokenizer | Exists, fixed — handles template literals, block/line comments, strings, operators |
 | `repo_similarity/normalizer.py` | Identifier normalization to `ID1`, `ID2`, … | Exists — no type distinction (all identifiers use same `IDn` namespace, see TICKET-006) |
 | `repo_similarity/fingerprint.py` | k-shingle SHA-1 fingerprinting with two modes: `fingerprints_from_norm` (set only) and `fingerprints_with_positions` (set + per-position list for block extraction) | Exists, enhanced |
-| `repo_similarity/similarity.py` | `jaccard`, bidirectional weighted `aggregate`, `compute_pairs` (A→B + B→A best-match passes, deduped), `_matched_blocks` (contiguous matching shingle-run extraction with token spans) | Exists, enhanced |
-| `scripts/run_similarity.py` | Full CLI: collects, tokenizes, normalizes, fingerprints, computes pairs, prints verdict table (LOW/MODERATE/HIGH/VERY HIGH) with matched block previews, writes JSON output | Exists, enhanced |
+| `repo_similarity/similarity.py` | `jaccard`, bidirectional weighted `aggregate`, `compute_pairs` (A→B + B→A best-match passes, deduped + `jaccard_cache` memoization), `_matched_blocks` (contiguous matching shingle-run extraction with token spans) | Exists, enhanced |
+| `scripts/run_similarity.py` | Full CLI with named module-level threshold/display constants (`VERY_HIGH_THRESHOLD`, `HIGH_THRESHOLD`, `MODERATE_THRESHOLD`, `MAX_DISPLAYED_BLOCKS`, `FILE_COLUMN_WIDTH`, etc.), try/except import fallback, verdict table, matched block previews, JSON output | Exists, enhanced — **⚠ has `MODERATE_SIMILARITY_THRESHOLD` NameError bug (see TICKET-051)** |
 | `README.md` | Project readme | Empty (just title) |
 
 **What this branch can do today:**
 - Tokenize JS/Java/Python/C++ source files (regex-based; handles comments, strings, template literals)
 - Normalize identifiers to `ID1`, `ID2`, … (correctly detects Type-1 and Type-2 clones)
 - Generate k-shingle (k=5) SHA-1 fingerprints with optional per-position tracking
-- Compute bidirectional best-match file pairs (A→B + B→A passes, deduped, sorted by Jaccard)
+- Compute bidirectional best-match file pairs (A→B + B→A passes, deduped, sorted by Jaccard); Jaccard results are memoized to avoid recomputation across both passes
 - Extract matched code blocks — contiguous runs of matching shingle positions merged into token-span ranges
-- Assign verdicts per pair: LOW / MODERATE / HIGH / VERY HIGH with configurable thresholds
-- Display matched block previews in console output (up to 5 per pair ≥ 0.3 similarity)
+- Assign verdicts per pair: LOW / MODERATE / HIGH / VERY HIGH using named threshold constants (no magic numbers)
+- Display matched block previews in console output (up to `MAX_DISPLAYED_BLOCKS=5` per pair)
 - Write a JSON results file with per-file metadata and pair detail
+- Import `repo_similarity` via try/except with `sys.path` fallback (no package install required)
 
 **What this branch cannot do:**
 - Accept a `submissions/` directory with N repos — hardcoded to exactly 2 paths
@@ -938,6 +943,25 @@ full intended list.
 
 ---
 
+#### TICKET-051 · `scripts/run_similarity.py` — `MODERATE_SIMILARITY_THRESHOLD` NameError
+
+**Priority:** Critical (runtime crash)
+
+`MODERATE_THRESHOLD = 0.3` is defined at module level but the code references the
+undeclared name `MODERATE_SIMILARITY_THRESHOLD` in two places:
+
+- Line 42: `if score >= MODERATE_SIMILARITY_THRESHOLD:` inside `_verdict()`
+- Line 82: `flagged = [p for p in pairs if p["jaccard"] >= MODERATE_SIMILARITY_THRESHOLD]`
+
+**Impact:** Any invocation of `print_report` triggers the list comprehension on line 82
+unconditionally — `NameError: name 'MODERATE_SIMILARITY_THRESHOLD' is not defined` is
+raised every time the CLI is run. The script is currently broken for all inputs.
+
+**Fix:** Either rename the constant at the top from `MODERATE_THRESHOLD` to
+`MODERATE_SIMILARITY_THRESHOLD`, or update both usages to `MODERATE_THRESHOLD`.
+
+---
+
 ## Track C — Future Feature Tickets
 
 Features not implemented in either branch, drawn from the roadmap docs.
@@ -1113,6 +1137,7 @@ when a new commit or PR is pushed to a monitored repository.
 | TICKET-037 | No Python/Java AST structural support | B | Medium | Open |
 | TICKET-038 | Type-4 not implemented | B | Low | Open |
 | TICKET-039 | boilerplate_filter — Ellipsis literal bug | B | Low | Open |
+| TICKET-051 | `run_similarity.py` — `MODERATE_SIMILARITY_THRESHOLD` NameError | B | Critical | Open — script crashes on every run; `MODERATE_THRESHOLD` defined but `MODERATE_SIMILARITY_THRESHOLD` used on lines 42 and 82 |
 | TICKET-040 | Python AST Structural Analysis | C | High | Open |
 | TICKET-041 | Java AST Support | C | Medium | Open |
 | TICKET-042 | C/C++ AST Support | C | Low | Open |
