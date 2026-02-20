@@ -1,43 +1,150 @@
-# Similarity Analysis For Repos - Implementation Plan
+# Similarity Analysis System — Implementation Plan
 
 ## Context
 
-This document tracks all work required to evolve the current `master` branch into a
+This document tracks all work required to evolve the current codebase into a
 production-grade plagiarism detection system. Tickets are grouped into three tracks:
 
-- **Track A** — Bring master to parity with `code-similarity-repo-improvements`
-- **Track B** — Fix known gaps/bugs that exist even in the improvements branch
+- **Track A** — Core features needed to reach the target architecture
+- **Track B** — Known gaps/bugs in the current modular `repo_similarity` package
 - **Track C** — Future features not implemented in either branch
+
+**Active branch:** `feat/stable-fix`
+**Last updated:** 2026-02-20 (reflects state after commit `63bda82`)
+
+### Use-Case Scope
+
+The system must handle **N student repository submissions for a single coding question**
+(typically 30–100 repos per question). This is not a 2-repo diff tool.
+
+Implications:
+- **Input model**: a single `submissions/` directory containing N subdirectories (one per student), not two explicit repo paths.
+- **Comparison scale**: N=100 → C(100,2) = 4,950 candidate pairs. Exhaustive pairwise fingerprint comparison without candidate filtering is unacceptable at this scale → MinHash + LSH is **critical**, not optional.
+- **Output**: a ranked similarity matrix / report across all suspicious submission pairs, not a single-pair diff.
+- **Correctness bar**: false negatives (missed plagiarism) are worse than false positives — thresholds should be tuned conservatively.
 
 ---
 
-## Current State of `master`
+## Current State of `feat/stable-fix` (active branch)
+
+> Last significant commits on this branch:
+> - `63bda82` — Refactor normalization and similarity modules; enhance fingerprinting and reporting
+> - `798548a` — Merge PR #3 from `feature/modularize-normalization`
+> - `58a78e3` — Make normalization pipeline configurable and address review feedback
 
 | File | Role | Status |
 |---|---|---|
 | `detector/normalization.py` | Monolithic tokenizer + normalizer + fingerprinter + similarity + CLI | Legacy monolith — to be phased out |
-| `repo_similarity/constants.py` | Language keywords, file extensions, defaults | Exists, partial |
-| `repo_similarity/tokenizer.py` | File reading + tokenization | Exists, fixed |
-| `repo_similarity/normalizer.py` | Identifier normalization (`ID1`, `ID2`, …) | Exists, basic |
-| `repo_similarity/fingerprint.py` | k-shingle SHA-1 fingerprinting | Exists, fixed |
-| `repo_similarity/similarity.py` | Jaccard + bidirectional aggregate | Exists |
-| `scripts/run_similarity.py` | CLI entry point | Exists |
+| `repo_similarity/constants.py` | Language keywords (JS/Java/Python/C++), 5 file extensions, default config values | Exists — missing `.ts`/`.tsx`/`.jsx` extensions and TS-specific keywords (see TICKET-035, TICKET-036) |
+| `repo_similarity/tokenizer.py` | File reading (`read_text`), directory walking (`collect_code_files`), regex tokenizer | Exists, fixed — handles template literals, block/line comments, strings, operators |
+| `repo_similarity/normalizer.py` | Identifier normalization to `ID1`, `ID2`, … | Exists — no type distinction (all identifiers use same `IDn` namespace, see TICKET-006) |
+| `repo_similarity/fingerprint.py` | k-shingle SHA-1 fingerprinting with two modes: `fingerprints_from_norm` (set only) and `fingerprints_with_positions` (set + per-position list for block extraction) | Exists, enhanced |
+| `repo_similarity/similarity.py` | `jaccard`, bidirectional weighted `aggregate`, `compute_pairs` (A→B + B→A best-match passes, deduped), `_matched_blocks` (contiguous matching shingle-run extraction with token spans) | Exists, enhanced |
+| `scripts/run_similarity.py` | Full CLI: collects, tokenizes, normalizes, fingerprints, computes pairs, prints verdict table (LOW/MODERATE/HIGH/VERY HIGH) with matched block previews, writes JSON output | Exists, enhanced |
 | `README.md` | Project readme | Empty (just title) |
 
-**What master can do today:**
-- Tokenize JS/Java/Python/C++ source files
-- Normalize identifiers to `ID1`, `ID2`, ...
-- Generate k-shingle (k=5) SHA-1 fingerprints
-- Compute pairwise Jaccard similarity (O(n²))
-- Output a JSON results file
+**What this branch can do today:**
+- Tokenize JS/Java/Python/C++ source files (regex-based; handles comments, strings, template literals)
+- Normalize identifiers to `ID1`, `ID2`, … (correctly detects Type-1 and Type-2 clones)
+- Generate k-shingle (k=5) SHA-1 fingerprints with optional per-position tracking
+- Compute bidirectional best-match file pairs (A→B + B→A passes, deduped, sorted by Jaccard)
+- Extract matched code blocks — contiguous runs of matching shingle positions merged into token-span ranges
+- Assign verdicts per pair: LOW / MODERATE / HIGH / VERY HIGH with configurable thresholds
+- Display matched block previews in console output (up to 5 per pair ≥ 0.3 similarity)
+- Write a JSON results file with per-file metadata and pair detail
 
-**What master cannot do:**
+**What this branch cannot do:**
+- Accept a `submissions/` directory with N repos — hardcoded to exactly 2 paths
+- Scalable N-way candidate retrieval (no MinHash, no LSH, no Winnowing — O(n²) breaks above ~20 repos)
 - Type-3 / Type-4 clone detection (no AST, no structural analysis)
-- Scalable candidate retrieval (no MinHash, no LSH, no winnowing)
 - Dead code preprocessing
 - Boilerplate filtering
-- Pipeline orchestration
-- Structured reporting / HTML diffs
+- Typed identifier normalization (VAR / FUNC / CLASS distinction)
+- Full pipeline orchestration with stage boundaries
+- N-way similarity report (ranked pair matrix across all submissions)
+- Side-by-side HTML diffs
+
+---
+
+## Recommended Project Structure
+
+`repo_similarity/` (the working detection engine) is kept in place. New packages
+are added around it — nothing is renamed or moved until replacements are stable.
+
+```
+ns-plag-sys/
+│
+├── config/
+│   ├── __init__.py
+│   └── constants.py              # TICKET-001 — all thresholds, flags, output dirs
+│
+├── ingestion/
+│   ├── __init__.py
+│   └── repository_collector.py  # TICKET-004 — walk submissions/ → {student: {rel: path}}
+│
+├── repo_similarity/              # KEEP — working detection engine (do not move yet)
+│   ├── __init__.py
+│   ├── constants.py
+│   ├── tokenizer.py
+│   ├── normalizer.py
+│   ├── fingerprint.py
+│   └── similarity.py
+│
+├── indexing/                     # TICKET-007–010 — scalable N-way candidate retrieval
+│   ├── __init__.py
+│   ├── minhash.py                # MinHash signatures (128 permutations)
+│   ├── winnowing.py              # Winnowing fingerprint selection
+│   ├── boilerplate_filter.py     # Entropy + pattern-based boilerplate detection
+│   └── candidate_retrieval.py   # LSH bucketing → candidate pairs for N repos
+│
+├── comparison/                   # TICKET-016 — unified Type-1/2/3/4 scoring
+│   ├── __init__.py
+│   └── similarity_calculator.py
+│
+├── reporting/                    # TICKET-017–018 — N-way report generation
+│   ├── __init__.py
+│   ├── similarity_report.py      # Ranked pair list JSON + text summary
+│   └── diff_generator.py         # Per-pair HTML diff
+│
+├── runner/                       # TICKET-019–020 — orchestration + CLI
+│   ├── __init__.py
+│   ├── orchestrator.py           # PlagiarismDetectionPipeline (N repos)
+│   └── run_all.py                # python -m runner.run_all <submissions_dir>
+│
+├── tests/                        # TICKET-022–026
+│   ├── test_normalization.py
+│   ├── test_indexing.py
+│   ├── test_structural_analysis.py
+│   ├── test_dead_code.py
+│   └── test_integration.py
+│
+├── scripts/
+│   └── run_similarity.py         # KEEP — 2-repo CLI for quick dev/debug use
+│
+├── detector/
+│   └── normalization.py          # KEEP for now — legacy monolith, phase out last
+│
+├── output/                       # gitignored — generated artefacts
+│   ├── reports/
+│   └── diffs/
+│
+├── demo_submissions/             # TICKET-021 — N-repo smoke-test fixture
+│   ├── student_A/
+│   ├── student_B/
+│   └── student_C/
+│
+├── requirements.txt              # TICKET-002
+└── README.md                     # TICKET-003
+```
+
+**Input model change (current → target):**
+```bash
+# Current — exactly 2 repo paths:
+python scripts/run_similarity.py <repo1_dir> <repo2_dir>
+
+# Target — submissions directory with N subdirs (one per student):
+python -m runner.run_all <submissions_dir>/
+```
 
 ---
 
@@ -226,11 +333,13 @@ fingerprint generation.
 
 #### TICKET-008 · MinHash + LSH
 
-**Priority:** High
+**Priority:** Critical (N-way scale makes this non-optional)
 **Depends on:** TICKET-007
 
 Add probabilistic Jaccard estimation using MinHash signatures and Locality
 Sensitive Hashing so candidate pairs can be found in near-O(n) time instead of O(n²).
+For N=100 submissions this reduces 4,950 full pairwise comparisons to a small
+candidate set, making the system practical at classroom scale.
 
 **Algorithm:**
 - MinHash: for each of 128 permutations `h_i(x) = (a*x + b) mod p`, take
@@ -277,16 +386,19 @@ Prevent common template/library code from inflating similarity scores.
 **Priority:** High
 **Depends on:** TICKET-007, TICKET-008, TICKET-009
 
-Wire all indexing components into a unified retrieval API that:
-1. Runs MinHash + LSH for fast initial candidate set
-2. Verifies candidates with Winnowing (more precise)
-3. Removes boilerplate-flagged files
-4. Returns only cross-repository pairs above threshold
+Wire all indexing components into a unified retrieval API that operates across
+**all N submissions at once** (not just 2):
+1. Builds MinHash signatures for every file across all N repos
+2. Uses LSH to bucket files → candidate (file_a, file_b) pairs across all submissions
+3. Verifies candidates with Winnowing (more precise Jaccard)
+4. Removes boilerplate-flagged files
+5. Returns only cross-submission pairs above threshold (same submission pairs are ignored)
 
 **Deliverables:**
 - `indexing/candidate_retrieval.py`:
-  - `CandidateRetriever.retrieve_candidates_hybrid(flat_tokens, use_lsh)` → list of (file_a, file_b, score)
-  - `InvertedIndex`: token → set of file IDs for fast intersection lookup
+  - `CandidateRetriever.retrieve_candidates_hybrid(all_repo_tokens: dict[str, dict], use_lsh)` → list of (repo_a, file_a, repo_b, file_b, score)
+  - Input: `{repo_name: {rel_path: norm_tokens}}` for all N repos simultaneously
+  - `InvertedIndex`: token → set of (repo_name, file_id) for fast intersection lookup
 
 ---
 
@@ -451,40 +563,55 @@ overall = type_1 * 0.4 + type_2 * 0.3 + type_3 * 0.2 + type_4 * 0.1
 
 ---
 
-#### TICKET-017 · JSON Similarity Report
+#### TICKET-017 · N-Way Similarity Report
 
 **Priority:** High
 **Depends on:** TICKET-016
 
-Generate a structured JSON report summarizing all detected similarities.
+Generate a structured JSON report summarizing detected similarities across **all N
+submissions**. The report covers every suspicious submission-pair found, not just
+a single pair.
 
 **Report structure:**
 ```json
 {
-  "metadata": { "timestamp", "repos", "total_files" },
-  "summary": { "total_pairs", "avg_similarity", "high_count", "med_count", "low_count" },
-  "configuration": { all threshold values },
-  "dead_code_stats": { "files_processed", "files_with_dead_code", "total_dead_lines_removed", "dead_code_percentage" },
-  "repository_pairs": [
+  "metadata": {
+    "timestamp", "question_id", "total_submissions", "total_files",
+    "candidate_pairs_checked", "suspicious_pairs_found"
+  },
+  "summary": {
+    "total_suspicious_pairs", "very_high_count", "high_count", "medium_count",
+    "avg_similarity_of_suspicious"
+  },
+  "configuration": { "all threshold values" },
+  "dead_code_stats": {
+    "files_processed", "files_with_dead_code",
+    "total_dead_lines_removed", "dead_code_percentage"
+  },
+  "suspicious_pairs": [
     {
-      "repo_a", "repo_b", "overall_similarity",
+      "submission_a", "submission_b", "overall_similarity", "verdict",
       "clone_type_distribution": { "type_1", "type_2", "type_3", "type_4" },
       "file_pairs": [
-        { "file_a", "file_b", "type_1", "type_2", "type_3", "type_4", "overall", "confidence" }
+        { "file_a", "file_b", "type_1", "type_2", "type_3", "type_4",
+          "overall", "confidence" }
       ]
     }
   ]
 }
 ```
 
+Note: `suspicious_pairs` is sorted by `overall_similarity` descending so the
+most likely plagiarism appears first.
+
 **Deliverables:**
 - `reporting/similarity_report.py`:
   - `SimilarityReport.to_dict()` / `to_json()`
-  - `ReportGenerator.add_similarity_result(repo_a, repo_b, scores)`
+  - `ReportGenerator.add_pair_result(submission_a, submission_b, scores)`
   - `ReportGenerator.set_configuration(config_dict)`
   - `ReportGenerator.set_dead_code_statistics(stats)`
   - `ReportGenerator.save_report(path)`
-  - `TextReport.generate_summary()` — human-readable text
+  - `TextReport.generate_summary()` — human-readable ranked list
 - `reporting/__init__.py`
 
 ---
@@ -513,20 +640,29 @@ Generate per-pair HTML files showing matched code segments highlighted side-by-s
 **Priority:** Critical
 **Depends on:** all previous milestones
 
-Wire all stages into a single `PlagiarismDetectionPipeline` class with clear
-stage boundaries and progress output.
+Wire all stages into a single `PlagiarismDetectionPipeline` class that accepts
+a **submissions directory** (N repos) and produces one report covering all
+suspicious pairs found.
 
 **8-stage pipeline:**
 ```
-Stage 1  → load_repositories()
+Stage 1  → load_submissions(submissions_dir)
+             discovers all N subdirectories; each subdir = one student submission
 Stage 2  → load_source_code()
+             tokenizes all files across all N submissions
 Stage 2.5→ preprocess_dead_code()     [optional, guarded by DETECT_DEAD_CODE]
 Stage 3  → normalize_code()
 Stage 4  → filter_boilerplate()
-Stage 5  → find_candidates()          [early return if no candidates]
+Stage 5  → find_candidates()
+             MinHash + LSH across ALL N submissions simultaneously
+             → candidate (submission_i, submission_j) pairs
+             early return if no candidates found
 Stage 6  → load_asts()               [skipped if already loaded]
-Stage 7  → compute_similarities()    [early return if no results above threshold]
+Stage 7  → compute_similarities()
+             full similarity score for each candidate pair only
+             early return if no results above threshold
 Stage 8  → generate_report()
+             N-way JSON report + optional HTML diffs per suspicious pair
 ```
 
 **Deliverables:**
@@ -541,30 +677,33 @@ Stage 8  → generate_report()
 **Depends on:** TICKET-019
 
 **Deliverables:**
-- `runner/run_all.py` — full pipeline CLI:
+- `runner/run_all.py` — full pipeline CLI (N submissions):
   ```bash
-  python -m runner.run_all /path/to/repo1 /path/to/repo2
+  # submissions_dir/ contains one subdir per student
+  python -m runner.run_all <submissions_dir> [--output report.json] [--threshold 0.5]
   ```
-- `runner/run_dead_code.py` — standalone dead code analysis:
+- `runner/run_dead_code.py` — standalone dead code analysis on a single repo:
   ```bash
-  python -m runner.run_dead_code /path/to/repo
+  python -m runner.run_dead_code <repo_dir>
   ```
 
 ---
 
-#### TICKET-021 · Demo Repository & Sample Test Cases
+#### TICKET-021 · Demo Submissions & Sample Test Cases
 
 **Priority:** Medium
 **Depends on:** TICKET-011, TICKET-019
 
-Create paired demo repositories with intentional plagiarism + dead code for
-end-to-end smoke testing.
+Create a `demo_submissions/` directory that mirrors real usage: N student directories,
+some of which contain intentional plagiarism and dead code, so the full pipeline can
+be smoke-tested end-to-end with a single command.
 
 **Deliverables:**
-- `demo_repo/repoA/` — original JS files (including dead code sections)
-- `demo_repo/repoB/` — plagiarised variants with renamed variables + dead code
+- `demo_submissions/student_A/` — original JS/Python files with dead code sections
+- `demo_submissions/student_B/` — plagiarised variant (renamed variables, reordered blocks)
+- `demo_submissions/student_C/` — independent original submission (should score LOW vs A and B)
 - Pre-generated ASTs in `output/ast_tree/`
-- Pre-generated clean code in `output/clean_code/`
+- Expected output fixture `tests/fixtures/demo_report_expected.json` for integration assertion
 
 ---
 
@@ -636,10 +775,11 @@ end-to-end smoke testing.
 **Priority:** High
 **Depends on:** TICKET-019, TICKET-021
 
-Run the full pipeline against `demo_repo/repoA` and `demo_repo/repoB` and assert:
-- Overall repo similarity > 0.7 (files are intentional plagiarism)
+Run the full pipeline against `demo_submissions/` and assert:
+- `student_A` ↔ `student_B` overall similarity > 0.7 (intentional plagiarism)
+- `student_C` scores LOW vs both A and B (independent submission)
 - Dead code lines removed match expected counts
-- Output report JSON is valid and conforms to expected schema
+- Output report JSON is valid, conforms to schema, and matches `tests/fixtures/demo_report_expected.json`
 
 **Deliverables:** `tests/test_integration.py`
 
@@ -934,33 +1074,33 @@ when a new commit or PR is pushed to a monitored repository.
 
 | Ticket | Title | Track | Priority | Status |
 |---|---|---|---|---|
-| TICKET-001 | Centralized Configuration Package | A | Critical | Open |
-| TICKET-002 | Requirements File | A | Critical | Open |
-| TICKET-003 | README Rewrite | A | High | Open |
-| TICKET-004 | Repository Ingestion Package | A | Critical | Open |
-| TICKET-005 | Upgrade Tokenizer for Full JS/TS Support | A | High | Open |
-| TICKET-006 | Upgrade Normalizer with Typed Abstraction | A | High | Open |
+| TICKET-001 | Centralized Configuration Package | A | Critical | Open — `repo_similarity/constants.py` covers basic values; full `config/` package with all thresholds not yet created |
+| TICKET-002 | Requirements File | A | Critical | Open — no `requirements.txt` exists |
+| TICKET-003 | README Rewrite | A | High | Open — `README.md` is empty |
+| TICKET-004 | Repository Ingestion Package | A | Critical | Open — `collect_code_files` in `tokenizer.py` covers basic walking; no `ingestion/` package |
+| TICKET-005 | Upgrade Tokenizer for Full JS/TS Support | A | High | Partial — template literals and comments handled; TypeScript keyword set incomplete (blocked by TICKET-036) |
+| TICKET-006 | Upgrade Normalizer with Typed Abstraction | A | High | Open — all identifiers still use same `IDn` namespace; no VAR/FUNC/CLASS distinction |
 | TICKET-007 | Winnowing Algorithm | A | High | Open |
-| TICKET-008 | MinHash + LSH | A | High | Open |
+| TICKET-008 | MinHash + LSH | A | Critical | Open — mandatory for N=30–100 scale; without it C(N,2) exhaustive comparison is too slow |
 | TICKET-009 | Boilerplate Filter | A | Medium | Open |
-| TICKET-010 | Candidate Retrieval (Hybrid Strategy) | A | High | Open |
+| TICKET-010 | Candidate Retrieval (Hybrid Strategy) | A | High | Open — must operate across all N submissions simultaneously, not just 2 |
 | TICKET-011 | Node.js AST Generation (JS/TS) | A | High | Open |
 | TICKET-012 | AST Processor | A | High | Open |
 | TICKET-013 | Tree Hashing | A | High | Open |
 | TICKET-014 | Function Fingerprinter | A | Medium | Open |
 | TICKET-015 | Dead Code Detection & Filtering | A | High | Open |
-| TICKET-016 | Unified Similarity Calculator | A | Critical | Open |
-| TICKET-017 | JSON Similarity Report | A | High | Open |
+| TICKET-016 | Unified Similarity Calculator | A | Critical | Open — `similarity.py` has Jaccard; no weighted Type-1/2/3/4 scoring |
+| TICKET-017 | N-Way Similarity Report | A | High | Partial — 2-repo JSON output exists in CLI; N-way report with metadata/summary/ranked pairs not yet built |
 | TICKET-018 | Side-by-Side HTML Diff Generator | A | Medium | Open |
-| TICKET-019 | Main Pipeline Orchestrator | A | Critical | Open |
-| TICKET-020 | CLI Entry Points | A | High | Open |
-| TICKET-021 | Demo Repository & Sample Test Cases | A | Medium | Open |
-| TICKET-022 | Unit Tests — Normalization | A | High | Open |
+| TICKET-019 | Main Pipeline Orchestrator | A | Critical | Open — no submissions-dir N-repo pipeline; `scripts/run_similarity.py` handles exactly 2 paths |
+| TICKET-020 | CLI Entry Points | A | High | Partial — `scripts/run_similarity.py` (2-repo) works; `runner/run_all.py <submissions_dir>` (N-repo) not built |
+| TICKET-021 | Demo Submissions & Sample Test Cases | A | Medium | Partial — `test_repos/student_A` and `student_B` exist (gitignored, 2 repos only); no `demo_submissions/` with ≥3 students and ASTs |
+| TICKET-022 | Unit Tests — Normalization | A | High | Open — no `tests/` directory exists |
 | TICKET-023 | Unit Tests — Indexing | A | High | Open |
 | TICKET-024 | Unit Tests — Structural Analysis | A | Medium | Open |
 | TICKET-025 | Unit Tests — Dead Code Detection | A | Medium | Open |
 | TICKET-026 | Integration Test — End-to-End Pipeline | A | High | Open |
-| TICKET-027 | CI Configuration | A | Medium | Open |
+| TICKET-027 | CI Configuration | A | Medium | Open — no `.github/workflows/` directory |
 | TICKET-028 | Architecture Document | A | Medium | Open |
 | TICKET-029 | Dead Code Detection Document | A | Low | Open |
 | TICKET-030 | Developer Guide | A | Low | Open |
@@ -968,8 +1108,8 @@ when a new commit or PR is pushed to a monitored repository.
 | TICKET-032 | Fix fingerprint duplicate function | B | — | ✅ Done |
 | TICKET-033 | Fix stale TODO comment | B | — | ✅ Done |
 | TICKET-034 | Fix orchestrator dead code block | B | — | ✅ Done |
-| TICKET-035 | constants.py — Missing file extensions | B | Low | Open |
-| TICKET-036 | Tokenizer — Incomplete JS keyword set | B | Medium | Open |
+| TICKET-035 | constants.py — Missing file extensions | B | Low | Open — `CODE_EXTENSIONS` has only 5 entries; `.ts`, `.tsx`, `.jsx`, `.go`, `.rb`, `.php`, `.cs` absent |
+| TICKET-036 | Tokenizer — Incomplete JS keyword set | B | Medium | Open — TS keywords (`interface`, `declare`, `namespace`, `readonly`, `module`, etc.) missing from `repo_similarity/constants.py`; present only in legacy `detector/normalization.py` |
 | TICKET-037 | No Python/Java AST structural support | B | Medium | Open |
 | TICKET-038 | Type-4 not implemented | B | Low | Open |
 | TICKET-039 | boilerplate_filter — Ellipsis literal bug | B | Low | Open |
